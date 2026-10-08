@@ -301,34 +301,89 @@ chrome.runtime.onConnect.addListener(function (port) {
             return;
           }
 
-          // 1. Request screenshot of the question element from content script
-          const [tab] = await chrome.tabs.query({
-            active: true,
-            currentWindow: true,
-          });
-          if (!tab || !tab.id) {
-            port.postMessage({
-              error: "No active tab found. Please open a Sparx Learning page and make sure the extension has access to it.",
+// 1. Request screenshot of the question element from content script
+const [tab] = await chrome.tabs.query({
+  active: true,
+  currentWindow: true,
+});
+
+if (!tab || !tab.id) {
+  port.postMessage({
+    error:
+      "No active tab found. Please open a Sparx Learning page and make sure the extension has access to it.",
+  });
+  port.disconnect();
+  return;
+}
+
+// Auto Solve can reach this point before the next question has appeared.
+// Wait/retry only while Auto Solve is enabled.
+const { autoSolveEnabled } = await new Promise((resolve) =>
+  chrome.storage.local.get(["autoSolveEnabled"], resolve)
+);
+
+let dataUrlResponse = null;
+
+if (autoSolveEnabled) {
+  const maxAttempts = 20;
+  const waitBetweenAttempts = 500;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    dataUrlResponse = await new Promise((resolve) => {
+      chrome.tabs.sendMessage(
+        tab.id,
+        { action: "captureQuestionScreenshot" },
+        (response) => {
+          if (chrome.runtime.lastError) {
+            resolve({
+              error: chrome.runtime.lastError.message,
             });
-            port.disconnect();
             return;
           }
-          const dataUrlResponse = await new Promise((resolve) => {
-            chrome.tabs.sendMessage(
-              tab.id,
-              { action: "captureQuestionScreenshot" },
-              (response) => resolve(response)
-            );
+
+          resolve(response);
+        }
+      );
+    });
+
+    if (dataUrlResponse && !dataUrlResponse.error) {
+      break;
+    }
+
+    // Give the next question time to render.
+    await new Promise((resolve) =>
+      setTimeout(resolve, waitBetweenAttempts)
+    );
+  }
+} else {
+  // Manual Solve behaves exactly as before: one immediate attempt.
+  dataUrlResponse = await new Promise((resolve) => {
+    chrome.tabs.sendMessage(
+      tab.id,
+      { action: "captureQuestionScreenshot" },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          resolve({
+            error: chrome.runtime.lastError.message,
           });
-          if (!dataUrlResponse || dataUrlResponse.error) {
-            port.postMessage({
-              error:
-                dataUrlResponse?.error ||
-                "Failed to capture screenshot of the question. This may happen if: 1) The content script is not loaded, 2) You're on an unsupported page, or 3) The question element is not visible. Please refresh the page and try again.",
-            });
-            port.disconnect();
-            return;
-          }
+          return;
+        }
+
+        resolve(response);
+      }
+    );
+  });
+}
+
+if (!dataUrlResponse || dataUrlResponse.error) {
+  port.postMessage({
+    error:
+      dataUrlResponse?.error ||
+      "Failed to capture screenshot of the question. This may happen if: 1) The content script is not loaded, 2) You're on an unsupported page, or 3) The question element is not visible. Please refresh the page and try again.",
+  });
+  port.disconnect();
+  return;
+}
           const dataUrl = dataUrlResponse.dataUrl;
           const base64ImageData = dataUrl.split(",")[1];
 
@@ -359,7 +414,7 @@ chrome.runtime.onConnect.addListener(function (port) {
                 },
               ],
               stream: true,
-              max_tokens: 60000,
+              max_tokens: 4000,
               temperature: 0.3,
             };
 
